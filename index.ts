@@ -2,6 +2,7 @@ import { groq } from "@ai-sdk/groq";
 import { Octokit } from "@octokit/rest";
 import { extractReasoningMiddleware, generateText, experimental_wrapLanguageModel as wrapLanguageModel } from "ai";
 import { config } from "dotenv";
+import readline from 'readline';
 import { parseStringPromise } from "xml2js";
 
 config({ path: ".env.local" });
@@ -25,6 +26,69 @@ const enhancedModel = wrapLanguageModel({
 interface FileContent {
   path: string;
   content: string;
+}
+
+interface RepoFile {
+  path: string;
+  content: string;
+  sha: string;
+}
+
+async function getRepoFiles(path = ""): Promise<RepoFile[]> {
+  const files: RepoFile[] = [];
+
+  try {
+    const { data: contents } = await octokit.repos.getContent({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      path
+    });
+
+    for (const item of Array.isArray(contents) ? contents : [contents]) {
+      console.log("Item:", item);
+      if (item.type === "file") {
+        const { data: blob } = await octokit.git.getBlob({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          file_sha: item.sha
+        });
+
+        files.push({
+          path: item.path,
+          content: Buffer.from(blob.content, 'base64').toString(),
+          sha: item.sha
+        });
+      } else if (item.type === "dir") {
+        files.push(...await getRepoFiles(item.path));
+      }
+    }
+  } catch (error) {
+    console.error(`Error reading ${path}:`, error);
+  }
+
+  return files;
+}
+
+async function getUserRequirements(): Promise<string> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  return new Promise((resolve) => {
+    rl.question(`Describe your feature request or code changes. You can specify:
+1. New features/functionality
+2. Code modifications
+3. Bug fixes
+4. Performance improvements
+5. Tests/documentation
+6. Specific files to modify
+
+Your requirements: `, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
 }
 
 function extractXMLFromResponse(text: string): string {
@@ -64,12 +128,21 @@ async function parseModelResponse(xmlResponse: string): Promise<GeneratedContent
 
 async function createAutomatedPR() {
   try {
+    console.log("Getting repo files...");
+    const repoFiles = await getRepoFiles();
+    console.log("Repo files:", repoFiles);
+    const codebaseContext = repoFiles.map(f => `${f.path}:\n${f.content}`).join('\n\n');
+    console.log("Codebase context:", codebaseContext);
+
+    const userRequirements = await getUserRequirements();
+    console.log("User requirements:", userRequirements);
     const { text: rawResponse, reasoning } = await generateText({
       model: enhancedModel,
       messages: [
         {
           role: "system",
-          content: `You are a TypeScript expert. Respond ONLY with valid XML in this exact format:
+          content: `You are a TypeScript expert. Analyze the following codebase and generate changes based on user requirements.
+Respond ONLY with valid XML in this format:
 <response>
   <pullRequest>
     <title>Title of the pull request</title>
@@ -77,65 +150,39 @@ async function createAutomatedPR() {
   </pullRequest>
   <files>
     <file>
-      <path>server/types.ts</path>
-      <content>// TypeScript code here</content>
+      <path>path/to/file</path>
+      <content>File content</content>
     </file>
-    <!-- Additional files -->
   </files>
 </response>
 
-Generate a complete Express server implementation with these files:
-- server/types.ts
-- server/config.ts
-- server/middleware/auth.ts
-- server/routes/webhook.ts
-- server/server.ts
-- server/README.md
-- server/.env.example
-
-Each file should be complete and production-ready with proper imports, error handling, and logging.`
+Current codebase:
+${codebaseContext}`
         },
         {
           role: "user",
-          content: `Create an Express server that:
-1. Listens for Gmail API push notifications (webhooks)
-2. Verifies incoming webhook authenticity using Google's authentication
-3. Handles Gmail notification payloads
-4. Includes proper TypeScript types for all webhooks and payloads
-5. Uses environment variables for configuration
-6. Implements proper error handling and logging
-7. Includes clear documentation for setup and usage
-
-The server should be production-ready and follow TypeScript/Node.js best practices.`
+          content: userRequirements
         }
       ]
     });
 
-    console.log("Raw Response:", rawResponse);
-    console.log("Reasoning:", reasoning);
-
     const xmlResponse = extractXMLFromResponse(rawResponse);
-    console.log("Extracted XML:", xmlResponse);
-
     const { files, pr } = await parseModelResponse(xmlResponse);
 
-    // Get the default branch
     const { data: repo } = await octokit.repos.get({
       owner: GITHUB_OWNER,
       repo: GITHUB_REPO
     });
 
     const defaultBranch = repo.default_branch;
-    const newBranch = `feature/gmail-webhook-server-${Date.now()}`;
+    const newBranch = `feature/${pr.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}`;
 
-    // Get the SHA of the default branch
     const { data: ref } = await octokit.git.getRef({
       owner: GITHUB_OWNER,
       repo: GITHUB_REPO,
       ref: `heads/${defaultBranch}`
     });
 
-    // Create a new branch
     await octokit.git.createRef({
       owner: GITHUB_OWNER,
       repo: GITHUB_REPO,
@@ -143,19 +190,17 @@ The server should be production-ready and follow TypeScript/Node.js best practic
       sha: ref.object.sha
     });
 
-    // Create/update all files
     for (const file of files) {
       await octokit.repos.createOrUpdateFileContents({
         owner: GITHUB_OWNER,
         repo: GITHUB_REPO,
         path: file.path,
-        message: `Add ${file.path}`,
+        message: `Update ${file.path}`,
         content: Buffer.from(file.content).toString("base64"),
         branch: newBranch
       });
     }
 
-    // Create pull request
     const { data: pullRequest } = await octokit.pulls.create({
       owner: GITHUB_OWNER,
       repo: GITHUB_REPO,
@@ -165,12 +210,11 @@ The server should be production-ready and follow TypeScript/Node.js best practic
       base: defaultBranch
     });
 
-    // Add model's reasoning as a PR comment
     await octokit.issues.createComment({
       owner: GITHUB_OWNER,
       repo: GITHUB_REPO,
       issue_number: pullRequest.number,
-      body: `## AI Model's Reasoning Process\n\n${reasoning}\n\n## Generated Files\n${files.map((f) => `- ${f.path}`).join("\n")}`
+      body: `## AI Model's Reasoning Process\n\n${reasoning}\n\n## Modified Files\n${files.map(f => `- ${f.path}`).join("\n")}`
     });
 
     console.log("Pull request created:", pullRequest.html_url);
@@ -182,4 +226,11 @@ The server should be production-ready and follow TypeScript/Node.js best practic
   }
 }
 
-createAutomatedPR();
+if (process.argv.includes('--interactive')) {
+  createAutomatedPR();
+} else {
+  console.log(`
+Usage: 
+    npm start -- --interactive    Start in interactive mode
+  `);
+}
